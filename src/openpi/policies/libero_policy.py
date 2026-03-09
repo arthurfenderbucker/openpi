@@ -97,4 +97,13 @@ class LiberoOutputs(transforms.DataTransformFn):
         # dimension, we need to now parse out the correct number of actions in the return dict.
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        actions = np.asarray(data["actions"])
+        
+        # Handle both Pi0/Pi05 output shape [action_horizon, action_dim] 
+        # and Pi0Grounded output shape [num_chunks, action_horizon, action_dim]
+        if actions.ndim == 3:
+            # Pi0Grounded: [num_chunks, action_horizon, action_dim] -> [num_chunks, action_horizon, 7]
+            return {"actions": actions[:, :, :7]}
+        else:
+            # Pi0/Pi05: [action_horizon, action_dim] -> [action_horizon, 7]
+            return {"actions": actions[:, :7]}

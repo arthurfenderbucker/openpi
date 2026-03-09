@@ -15,6 +15,7 @@ import tyro
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
+import openpi.models.pi0grounded_config as pi0grounded_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
@@ -136,6 +137,34 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
                 )
+            case _model.ModelType.PI0_GROUNDED:
+                # Pi0Grounded uses same transforms as Pi0/Pi05 depending on pi05 flag
+                assert isinstance(model_config, (pi0_config.Pi0Config, pi0grounded_config.Pi0GroundedConfig))
+                if model_config.pi05:
+                    # Use Pi05 transforms (with discrete_state_input support)
+                    return _transforms.Group(
+                        inputs=[
+                            _transforms.InjectDefaultPrompt(self.default_prompt),
+                            _transforms.ResizeImages(224, 224),
+                            _transforms.TokenizePrompt(
+                                _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                                discrete_state_input=model_config.discrete_state_input,
+                            ),
+                            _transforms.PadStatesAndActions(model_config.action_dim),
+                        ],
+                    )
+                else:
+                    # Use Pi0 transforms
+                    return _transforms.Group(
+                        inputs=[
+                            _transforms.InjectDefaultPrompt(self.default_prompt),
+                            _transforms.ResizeImages(224, 224),
+                            _transforms.TokenizePrompt(
+                                _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            ),
+                            _transforms.PadStatesAndActions(model_config.action_dim),
+                        ],
+                    )
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
                     _tokenizer.FASTTokenizer
@@ -743,6 +772,33 @@ _CONFIGS = [
     TrainConfig(
         name="pi05_libero",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    # Pi05Grounded config for multi-chunk action generation
+    TrainConfig(
+        name="pi05_libero_grounded",
+        model=pi0grounded_config.Pi0GroundedConfig(
+            pi05=True, 
+            action_horizon=10, 
+            discrete_state_input=False,
+            num_action_chunks=100,  # Generate 3 action chunks per inference
+        ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),

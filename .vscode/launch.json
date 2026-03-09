@@ -1,0 +1,40 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "LIBERO_PRO use_swap pi05",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/libero/main_pro.py",
+            "console": "integratedTerminal",
+            "env": {
+                "LIBERO_CONFIG_PATH": "/home/abucker/policy_abstraction/third_party/LIBERO-PRO",
+                "PORT": "8000",
+                "PYTHONPATH": "/home/abucker/policy_abstraction/third_party/LIBERO-PRO",
+                "MUJOCO_GL": "glx",
+                "DISPLAY": ":0",
+                "CUDA_VISIBLE_DEVICES": "0"
+
+                // "PYTHONPATH": "${workspaceFolder}/examples/libero/.venv/bin/python"
+            },
+            "args": [
+                "--args.port", "8000",
+                "--args.video_out_path", "data/libero/test_multi",
+                "--args.num_trials_per_task", "1",
+                "--args.task_suite_name", "libero_spatial",
+                "--args.use_swap"
+            ]
+        }
+    ]
+}

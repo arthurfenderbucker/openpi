@@ -46,6 +46,7 @@ services:
       - SERVER_ARGS
       - OPENPI_DATA_HOME=/openpi_assets
       - IS_DOCKER=true
+    command: /bin/bash
 
     # Comment out this block if not running on a machine with GPUs.
     deploy:
