@@ -4,6 +4,28 @@ import pathlib
 import time
 from typing import Any, TypeAlias
 
+import cloudpickle
+
+_GUIDANCE_KEY = "__guidance_fn__"
+_GUIDANCE_PARAMS_SENTINEL = "__gp_expected_dists__"
+_GUIDANCE_PARAMS_ALL_KEYS = (
+    "__gp_ee_pos_0__",
+    "__gp_dt__",
+    "__gp_expected_dists__",
+    "__gp_dist_types__",
+    "__gp_waypoints__",
+    "__gp_has_axis__",
+    "__gp_axes__",
+    "__gp_has_plane__",
+    "__gp_plane_normals__",
+    "__gp_surface_counts__",
+    "__gp_surface_pts__",
+    "__gp_guidance_factors__",
+    "__gp_guidance_factor__",
+    "__gp_num_chunks__",
+    "__gp_debug_guidance__",
+)
+
 import flax
 import flax.traverse_util
 import jax
@@ -66,6 +88,16 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        # Extract guidance (callable or params) before any transforms.
+        guidance_fn = None
+        guidance_params = None
+        if _GUIDANCE_KEY in obs:
+            guidance_fn = cloudpickle.loads(obs[_GUIDANCE_KEY].tobytes())
+            obs = {k: v for k, v in obs.items() if k != _GUIDANCE_KEY}
+        elif _GUIDANCE_PARAMS_SENTINEL in obs:
+            guidance_params = {k: obs[k] for k in _GUIDANCE_PARAMS_ALL_KEYS if k in obs}
+            obs = {k: v for k, v in obs.items() if k not in _GUIDANCE_PARAMS_ALL_KEYS}
+
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -89,9 +121,22 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
+
+        # =========== Guidance handling: ===========
+        if guidance_fn is not None and not self._is_pytorch_model:
+            # Bypass module_jit when guidance is a callable — Python closures can't
+            # be passed through jax.jit. The inner jax.lax.while_loop still JIT-compiles.
+            sample_kwargs["guidance_fn"] = guidance_fn
+            actions = self._model.sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        elif guidance_params is not None and not self._is_pytorch_model:
+            # Params are plain JAX arrays — fully JIT-compatible, no bypass needed.
+            sample_kwargs["guidance_params"] = {k: jnp.asarray(v) for k, v in guidance_params.items()}
+            actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        else:
+            actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            "actions": actions,
         }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:

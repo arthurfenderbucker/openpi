@@ -797,7 +797,7 @@ _CONFIGS = [
             pi05=True, 
             action_horizon=10, 
             discrete_state_input=False,
-            num_action_chunks=100,  # Generate 3 action chunks per inference
+            num_action_chunks=10,
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
