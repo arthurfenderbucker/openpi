@@ -794,10 +794,10 @@ _CONFIGS = [
     TrainConfig(
         name="pi05_libero_grounded",
         model=pi0grounded_config.Pi0GroundedConfig(
-            pi05=True, 
-            action_horizon=10, 
+            pi05=True,
+            action_horizon=10,
             discrete_state_input=False,
-            num_action_chunks=10,
+            num_action_chunks=2,
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",

@@ -30,23 +30,19 @@ from openpi.shared import array_typing as at
 logger = logging.getLogger(__name__)
 
 
-def _make_batch_grad_fn_from_params(guidance_params: dict):
-    """Build a batched gradient function from structured guidance parameter arrays.
+def _make_batch_guidance_fns_from_params(guidance_params: dict):
+    """Build batched loss AND gradient functions from structured guidance parameter arrays.
 
     Integrates x_t (SO3 velocity actions) to recover EE position trajectories,
     computes distances from those positions to the reference waypoints, then
-    returns the gradient of a squared-error potential via JAX autograd.
+    returns both a loss and a gradient of a squared-error potential via JAX autograd.
 
     For each pair *i* and chunk-timestep *k*::
 
         pos[k]       = ee_pos_0 + cumsum(x_t[:k+1, :3])
         dist[i, k]   = distance_fn_i(pos[k], waypoints[i])   (type-dependent)
         error[i, k]  = dist[i, k] - expected[i, k]
-        f(x_t)       = -0.5 * Σ_{i,k} error[i, k]²
-
-    ``jax.grad(f)(x_t)`` propagates through the cumsum integration, yielding
-    a gradient that steers each velocity step toward the reference distance
-    profile at all future timesteps (causal chain effect).
+        f(x_t)       = 0.5 * Σ_{i,k} (error[i, k] * gf_factor[i])²
 
     Distance type selection per pair (broadcast over T):
         - Surface (dist_type=1): min distance from pos to surface point cloud
@@ -54,25 +50,13 @@ def _make_batch_grad_fn_from_params(guidance_params: dict):
         - Plane (has_plane=1):   ||in_plane(waypoint - pos)||
         - Centroid (default):    ||pos - waypoint||
 
-    Axes are stored with sign encoding direction:
-        - ee_is_from: +axis   →  dist = dot(waypoint - pos, axis)
-        - ee_is_to:   -axis   →  dist = dot(waypoint - pos, -axis) = dot(pos - waypoint, axis)
-
     Args:
-        guidance_params: Dict with JAX arrays (keys match ``guidance_builder.GP_KEYS``):
-            - ``"__gp_ee_pos_0__"``:       (3,)      EE position at current step.
-            - ``"__gp_expected_dists__"``: (N, T)    ref distances per pair per chunk step.
-            - ``"__gp_dist_types__"``:     (N,)      uint8 distance type codes.
-            - ``"__gp_waypoints__"``:      (N, 3)    reference centroid per pair.
-            - ``"__gp_has_axis__"``:       (N,)      axis applicability flag.
-            - ``"__gp_axes__"``:           (N, 3)    signed axis vectors (zeros if unused).
-            - ``"__gp_has_plane__"``:      (N,)      plane applicability flag.
-            - ``"__gp_plane_normals__"``:  (N, 3)    plane normals (zeros if unused).
-            - ``"__gp_surface_counts__"``: (N,)      surface point counts (0 if centroid).
-            - ``"__gp_surface_pts__"``:    (N, S, 3) padded surface point clouds.
+        guidance_params: Dict with JAX arrays (keys match ``guidance_builder.GP_KEYS``).
 
     Returns:
-        ``jax.vmap(jax.grad(guidance_fn))`` — same interface as the callable path.
+        (batch_loss_fn, batch_grad_fn) where:
+        - batch_loss_fn(x_t) → (B,) per-sample losses
+        - batch_grad_fn(x_t) → (B, T, D) per-sample gradients
     """
     ee_pos_0 = jnp.array(guidance_params["__gp_ee_pos_0__"])  # (3,)
     dt = jnp.array(guidance_params["__gp_dt__"])  # scalar
@@ -85,71 +69,142 @@ def _make_batch_grad_fn_from_params(guidance_params: dict):
     plane_norms = jnp.array(guidance_params["__gp_plane_normals__"])  # (N, 3)
     surf_pts = jnp.array(guidance_params["__gp_surface_pts__"])  # (N, S, 3)
 
-    # Per-pair guidance weights. If the scalar override key is present, all
-    # per-pair factors are set to that value (uniform override).
     gf_factors = jnp.array(guidance_params["__gp_guidance_factors__"])  # (N,)
     if "__gp_guidance_factor__" in guidance_params:
         gf_factors = jnp.full_like(gf_factors, guidance_params["__gp_guidance_factor__"])
 
+    # EE orientation for orientation-type distance pairs
+    ee_ori_0 = jnp.array(guidance_params.get("__gp_ee_ori_0__", jnp.zeros(3)))
+
     def _guidance_fn(x_t):
         # x_t: (total_horizon, action_dim) — unbatched.
-        # Integrate translational velocities to get EE position at each step.
+        T = expected.shape[1]
+
+        # --- Position-based: integrate velocities to get EE positions --------
         vel = x_t[:, :3]  # (H, 3)
         positions = ee_pos_0[None, :] + jnp.cumsum(vel * dt, axis=0)  # (H, 3)
-
-        T = expected.shape[1]
         positions = positions[:T]  # (T, 3)
 
-        # diffs[t, i, :] = pos[t] - waypoints[i]
         diffs = positions[:, None, :] - waypoints[None, :, :]  # (T, N, 3)
 
-        # --- Centroid distances: ||pos - waypoint|| --------------------------
+        # Centroid distances: ||pos - waypoint||
         centroid_dists = jnp.sqrt(jnp.sum(diffs**2, axis=-1) + 1e-8)  # (T, N)
 
-        # --- Axis distances: dot(waypoint - pos, signed_axis) ----------------
-        # axes is stored signed, so: dot(-diffs[t,i], axes[i]) = -dot(diffs, axes)
+        # Axis distances: dot(waypoint - pos, signed_axis)
         axis_dists = -jnp.sum(diffs * axes[None, :, :], axis=-1)  # (T, N)
 
-        # --- Plane distances: ||in_plane(waypoint - pos)|| -------------------
+        # Axis perpendicular distances: ||component of diff perpendicular to axis||
+        axis_proj_scalar = jnp.sum(diffs * axes[None, :, :], axis=-1, keepdims=True)  # (T, N, 1)
+        perp_vec = diffs - axis_proj_scalar * axes[None, :, :]  # (T, N, 3)
+        axis_perp_dists = jnp.sqrt(jnp.sum(perp_vec**2, axis=-1) + 1e-8)  # (T, N)
+
+        # Plane distances: ||in_plane(waypoint - pos)||
         proj = jnp.sum(diffs * plane_norms[None, :, :], axis=-1, keepdims=True)  # (T, N, 1)
         in_plane = diffs - proj * plane_norms[None, :, :]  # (T, N, 3)
         plane_dists = jnp.sqrt(jnp.sum(in_plane**2, axis=-1) + 1e-8)  # (T, N)
 
-        # --- Surface distances: min ||pos - surf_pt|| over point cloud -------
-        # positions: (T, 3), surf_pts: (N, S, 3)
+        # Surface distances: min ||pos - surf_pt|| over point cloud
         pos_exp = positions[:, None, None, :]  # (T, 1, 1, 3)
         surf_exp = surf_pts[None, :, :, :]  # (1, N, S, 3)
         surf_d2 = jnp.sum((pos_exp - surf_exp) ** 2, axis=-1)  # (T, N, S)
         surface_dists = jnp.sqrt(jnp.min(surf_d2, axis=-1) + 1e-8)  # (T, N)
 
-        # --- Select distance per pair (broadcast flags over T) ---------------
-        is_surf = (dist_types > 0)[None, :]  # (1, N)
+        # --- Orientation-based: integrate angular velocities -----------------
+        ori_vel = x_t[:T, 3:6]  # (T, 3)
+        predicted_ori = ee_ori_0[None, :] + jnp.cumsum(ori_vel * dt, axis=0)  # (T, 3)
+        # Orientation "distance" = dot(predicted_ori, axis) per pair
+        ori_dists = jnp.sum(predicted_ori[:, None, :] * axes[None, :, :], axis=-1)  # (T, N)
+
+        # --- Gripper-based: absolute (not integrated) ------------------------
+        predicted_grip = x_t[:T, 6:7]  # (T, 1)
+        grip_dists = jnp.broadcast_to(predicted_grip, (T, expected.shape[0]))  # (T, N)
+
+        # --- Select distance per pair based on dist_type ---------------------
+        # dist_types: 0=centroid, 1=surface, 2=orientation, 3=gripper
+        is_surf = (dist_types == 1)[None, :]  # (1, N)
+        is_ori = (dist_types == 2)[None, :]  # (1, N)
+        is_grip = (dist_types == 3)[None, :]  # (1, N)
         ha = (has_axis > 0)[None, :]  # (1, N)
         hp = (has_plane > 0)[None, :]  # (1, N)
 
-        # dists = jnp.where(
-        #     is_surf, surface_dists, jnp.where(ha, axis_dists, jnp.where(hp, plane_dists, centroid_dists))
-        # )  # (T, N)
-
-        # TEMPORALLY DISABLE SURFACE AND PLANE DISTANCES FOR TESTING:
-        dists = jnp.where(
-            is_surf,
-            jnp.full_like(surface_dists, 0.0),  # effectively disable surface guidance
-            jnp.where(
-                ha,
-                axis_dists,  # effectively disable surface guidance
-                jnp.where(hp, jnp.full_like(plane_dists, 0.0), jnp.full_like(centroid_dists, 0.0)),
-            ),
+        # Position-type selection (centroid/axis/plane/surface)
+        pos_dists = jnp.where(
+            is_surf, surface_dists, jnp.where(ha, axis_dists, jnp.where(hp, plane_dists, centroid_dists))
         )  # (T, N)
 
+        # Final selection across all types
+        dists = jnp.where(is_ori, ori_dists, jnp.where(is_grip, grip_dists, pos_dists))  # (T, N)
+
         errors = dists.T - expected[:, :T]  # (N, T)
-        print("errors shape:", errors.shape)  # DEBUGGING
 
-        # Weight each pair's contribution by its guidance factor.
-        # gf_factors[:, None] *
-        return 0.5 * jnp.sum(errors**2)
+        # --- Perpendicular regularization for position axis pairs ------------
+        perp_ref = axis_perp_dists[0:1, :]  # (1, N) — initial perp distance
+        perp_errors = (axis_perp_dists - perp_ref).T  # (N, T)
+        # Only for position axis pairs (not orientation which also uses axes)
+        is_pos_axis = ha.T & ~is_ori.T & ~is_grip.T
+        perp_errors = jnp.where(is_pos_axis, perp_errors, 0.0)
 
-    return jax.vmap(jax.grad(_guidance_fn))
+        weighted = errors  # * gf_factors[:, None]  # (N, T)
+        return 0.5 * jnp.sum(weighted**2)  # + 0.5 * jnp.sum(perp_errors**2)
+
+    batch_loss_fn = jax.vmap(_guidance_fn)
+    batch_grad_fn = jax.vmap(jax.grad(_guidance_fn))
+    return batch_loss_fn, batch_grad_fn
+
+
+def _golden_section_line_search(batch_loss_fn, x_t, direction, max_alpha=1.0, n_iter=20):
+    """JIT-compatible golden-section line search for optimal step size.
+
+    Finds alpha in [0, max_alpha] minimizing sum(batch_loss_fn(x_t + alpha * direction)).
+    Uses pure JAX control flow (lax.fori_loop) so the entire search is compilable.
+
+    Args:
+        batch_loss_fn: (B, T, D) → (B,) per-sample loss.
+        x_t: current actions, shape (B, T, D).
+        direction: unit-length descent direction, shape (B, T, D).
+        max_alpha: initial upper bound for the search bracket.
+        n_iter: number of golden-section iterations.
+
+    Returns:
+        Scalar alpha (optimal step size).
+    """
+    gr = (jnp.sqrt(5.0) + 1.0) / 2.0  # golden ratio
+
+    def _total_loss(alpha):
+        return jnp.sum(batch_loss_fn(x_t + alpha * direction))
+
+    loss_at_zero = _total_loss(0.0)
+
+    # Bracket expansion: double b up to 5 times while loss decreases
+    def _expand_body(carry, _):
+        a, b, loss_b = carry
+        new_b = b * 2.0
+        new_loss = _total_loss(new_b)
+        should_expand = new_loss < _total_loss(b)
+        b = jnp.where(should_expand, new_b, b)
+        loss_b = jnp.where(should_expand, new_loss, loss_b)
+        return (a, b, loss_b), None
+
+    init_loss_b = _total_loss(max_alpha)
+    (a, b, _), _ = jax.lax.scan(_expand_body, (0.0, max_alpha, init_loss_b), None, length=5)
+
+    # Golden-section narrowing
+    def _gs_body(_, carry):
+        a, b = carry
+        c = b - (b - a) / gr
+        d = a + (b - a) / gr
+        loss_c = _total_loss(c)
+        loss_d = _total_loss(d)
+        new_a = jnp.where(loss_c < loss_d, a, c)
+        new_b = jnp.where(loss_c < loss_d, d, b)
+        return (new_a, new_b)
+
+    a, b = jax.lax.fori_loop(0, n_iter, _gs_body, (a, b))
+    alpha = (a + b) / 2.0
+
+    # Only step if it actually reduces loss
+    alpha = jnp.where(_total_loss(alpha) < loss_at_zero, alpha, 0.0)
+    return alpha
 
 
 class Pi0Grounded(pi0.Pi0):
@@ -160,7 +215,6 @@ class Pi0Grounded(pi0.Pi0):
         super().__init__(config, rngs)
         # Store the number of chunks for inference
         self.num_action_chunks = config.num_action_chunks
-        self.max_guidance_factor = 0.5
 
     @at.typecheck
     def embed_suffix(
@@ -271,16 +325,26 @@ class Pi0Grounded(pi0.Pi0):
         # Hoist outside the loop to avoid retracing jax.grad on every denoising step.
         # guidance_params (plain arrays) takes priority and keeps JIT active;
         # guidance_fn (callable) is the legacy path that bypasses module_jit.
+        batch_loss_fn = None
         if guidance_params is not None:
             num_action_chunks = guidance_params.get("__gp_num_chunks__", num_action_chunks)
-            batch_grad_fn = _make_batch_grad_fn_from_params(guidance_params)
+            # Truncate expected distances to first chunk only — guidance is
+            # computed exclusively on the first action chunk.
+            if "__gp_expected_dists__" in guidance_params:
+                guidance_params = dict(guidance_params)
+                guidance_params["__gp_expected_dists__"] = guidance_params["__gp_expected_dists__"][
+                    :, : self.action_horizon
+                ]
+            batch_loss_fn, batch_grad_fn = _make_batch_guidance_fns_from_params(guidance_params)
             guidance_factor = guidance_params.get("__gp_guidance_factor__", guidance_params.get("guidance_factor", 1.0))
         elif guidance_fn is not None:
             batch_grad_fn = jax.vmap(jax.grad(guidance_fn))
+            batch_loss_fn = jax.vmap(guidance_fn)
         else:
             batch_grad_fn = None
 
-        debug_guidance = guidance_params.get("__gp_debug_guidance__", True)
+        use_line_search = guidance_params.get("__gp_line_search__", True) if guidance_params is not None else False
+        debug_guidance = guidance_params.get("__gp_debug_guidance__", False) if guidance_params is not None else False
 
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -357,12 +421,38 @@ class Pi0Grounded(pi0.Pi0):
                 v_t = jnp.zeros_like(x_t)
 
             if batch_grad_fn is not None:
-                # Classifier-style guidance: grad_{x_t} guidance_fn(x_t) steers the ODE.
-                guidance_grad = batch_grad_fn(x_t)
-                print("x_t shape:", x_t.shape)  # DEBUGGING
-                print("guidance_grad shape:", guidance_grad.shape)  # DEBUGGING
+                # Only compute guidance gradients and alpha on the first action chunk;
+                # remaining chunks receive zero guidance.
+                x_t_first = x_t[:, : self.action_horizon, :]
+                guidance_grad_first = batch_grad_fn(x_t_first + v_t[:, : self.action_horizon, :] * dt)
 
-                v_t = v_t + guidance_factor * guidance_grad
+                # Normalize gradient to unit length per sample (scale-invariant direction)
+                grad_norm = jnp.linalg.norm(guidance_grad_first.reshape(batch_size, -1), axis=-1, keepdims=True)[
+                    :, :, None
+                ]  # (B, 1, 1)
+                grad_hat_first = guidance_grad_first / (grad_norm + 1e-8)  # unit ascent direction
+                if use_line_search and batch_loss_fn is not None:
+                    direction_first = -grad_hat_first  # unit descent direction
+                    alpha = _golden_section_line_search(
+                        batch_loss_fn,
+                        x_t_first,
+                        direction_first,
+                        max_alpha=1.0,
+                    )
+                    # Pad with zeros for remaining chunks
+                    direction = jnp.concatenate(
+                        [direction_first, jnp.zeros_like(x_t[:, self.action_horizon :, :])], axis=1
+                    )
+                    # Convert position-space step to velocity: dt * v_guidance = alpha * direction
+                    v_t = v_t + guidance_factor * (alpha / dt) * direction
+                else:
+                    # Pad with zeros for remaining chunks
+                    grad_hat = jnp.concatenate(
+                        [grad_hat_first, jnp.zeros_like(x_t[:, self.action_horizon :, :])], axis=1
+                    )
+                    # Blend normalized gradient into velocity field.
+                    # Since dt < 0, adding +grad_hat to v_t → dt * grad_hat moves in -grad (descent).
+                    v_t = v_t + guidance_factor * grad_hat
 
             return x_t + dt * v_t, time + dt
 

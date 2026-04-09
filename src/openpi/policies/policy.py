@@ -12,6 +12,7 @@ _GUIDANCE_PARAMS_ALL_KEYS = (
     "__gp_ee_pos_0__",
     "__gp_dt__",
     "__gp_expected_dists__",
+    "__gp_expected_stds__",
     "__gp_dist_types__",
     "__gp_waypoints__",
     "__gp_has_axis__",
@@ -24,6 +25,8 @@ _GUIDANCE_PARAMS_ALL_KEYS = (
     "__gp_guidance_factor__",
     "__gp_num_chunks__",
     "__gp_debug_guidance__",
+    # EE orientation (for orientation-type distance pairs)
+    "__gp_ee_ori_0__",
 )
 
 import flax
