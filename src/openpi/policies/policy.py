@@ -7,12 +7,12 @@ from typing import Any, TypeAlias
 import cloudpickle
 
 _GUIDANCE_KEY = "__guidance_fn__"
+_RNG_SEED_KEY = "__rng_seed__"
 _GUIDANCE_PARAMS_SENTINEL = "__gp_expected_dists__"
 _GUIDANCE_PARAMS_ALL_KEYS = (
     "__gp_ee_pos_0__",
     "__gp_dt__",
     "__gp_expected_dists__",
-    "__gp_expected_stds__",
     "__gp_dist_types__",
     "__gp_waypoints__",
     "__gp_has_axis__",
@@ -25,8 +25,12 @@ _GUIDANCE_PARAMS_ALL_KEYS = (
     "__gp_guidance_factor__",
     "__gp_num_chunks__",
     "__gp_debug_guidance__",
-    # EE orientation (for orientation-type distance pairs)
+    # Pose guidance (orientation + gripper)
     "__gp_ee_ori_0__",
+    "__gp_ref_orientation__",
+    "__gp_ori_weight__",
+    "__gp_ref_gripper__",
+    "__gp_gripper_weight__",
 )
 
 import flax
@@ -91,6 +95,12 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        # Extract per-inference RNG seed (if provided by client).
+        explicit_seed = None
+        if _RNG_SEED_KEY in obs:
+            explicit_seed = int(obs[_RNG_SEED_KEY])
+            obs = {k: v for k, v in obs.items() if k != _RNG_SEED_KEY}
+
         # Extract guidance (callable or params) before any transforms.
         guidance_fn = None
         guidance_params = None
@@ -107,7 +117,12 @@ class Policy(BasePolicy):
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
-            self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
+            if explicit_seed is not None:
+                # Deterministic: use the client-provided seed instead of
+                # advancing the internal RNG chain.
+                sample_rng_or_pytorch_device = jax.random.key(explicit_seed)
+            else:
+                self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
             # Convert inputs to PyTorch tensors and move to correct device
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
