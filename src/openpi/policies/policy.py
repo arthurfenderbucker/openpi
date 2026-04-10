@@ -23,6 +23,7 @@ _GUIDANCE_PARAMS_ALL_KEYS = (
     "__gp_surface_pts__",
     "__gp_guidance_factors__",
     "__gp_guidance_factor__",
+    "__gp_guidance_weights__",
     "__gp_num_chunks__",
     "__gp_debug_guidance__",
     # Pose guidance (orientation + gripper)
@@ -148,7 +149,13 @@ class Policy(BasePolicy):
             actions = self._model.sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
         elif guidance_params is not None and not self._is_pytorch_model:
             # Params are plain JAX arrays — fully JIT-compatible, no bypass needed.
-            sample_kwargs["guidance_params"] = {k: jnp.asarray(v) for k, v in guidance_params.items()}
+            # Boolean control-flow flags must stay as Python bools — converting
+            # them to JAX arrays causes TracerBoolConversionError inside jit.
+            _bool_keys = {"__gp_debug_guidance__", "__gp_line_search__"}
+            sample_kwargs["guidance_params"] = {
+                k: (bool(v) if k in _bool_keys else jnp.asarray(v))
+                for k, v in guidance_params.items()
+            }
             actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
         else:
             actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)

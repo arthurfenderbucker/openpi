@@ -69,9 +69,9 @@ def _make_batch_guidance_fns_from_params(guidance_params: dict):
     plane_norms = jnp.array(guidance_params["__gp_plane_normals__"])  # (N, 3)
     surf_pts = jnp.array(guidance_params["__gp_surface_pts__"])  # (N, S, 3)
 
-    gf_factors = jnp.array(guidance_params["__gp_guidance_factors__"])  # (N,)
+    gf_weights = jnp.array(guidance_params["__gp_guidance_weights__"])  # (N,)
     if "__gp_guidance_factor__" in guidance_params:
-        gf_factors = jnp.full_like(gf_factors, guidance_params["__gp_guidance_factor__"])
+        gf_weights = jnp.full_like(gf_weights, guidance_params["__gp_guidance_factor__"])
 
     # EE orientation for orientation-type distance pairs
     ee_ori_0 = jnp.array(guidance_params.get("__gp_ee_ori_0__", jnp.zeros(3)))
@@ -144,7 +144,7 @@ def _make_batch_guidance_fns_from_params(guidance_params: dict):
         is_pos_axis = ha.T & ~is_ori.T & ~is_grip.T
         perp_errors = jnp.where(is_pos_axis, perp_errors, 0.0)
 
-        weighted = errors  # * gf_factors[:, None]  # (N, T)
+        weighted = errors * gf_weights[:, None]  # (N, T)
         return 0.5 * jnp.sum(weighted**2)  # + 0.5 * jnp.sum(perp_errors**2)
 
     batch_loss_fn = jax.vmap(_guidance_fn)
@@ -326,6 +326,7 @@ class Pi0Grounded(pi0.Pi0):
         # guidance_params (plain arrays) takes priority and keeps JIT active;
         # guidance_fn (callable) is the legacy path that bypasses module_jit.
         batch_loss_fn = None
+        batch_grad_fn = None
         if guidance_params is not None:
             num_action_chunks = guidance_params.get("__gp_num_chunks__", num_action_chunks)
             # Truncate expected distances to first chunk only — guidance is
@@ -335,13 +336,11 @@ class Pi0Grounded(pi0.Pi0):
                 guidance_params["__gp_expected_dists__"] = guidance_params["__gp_expected_dists__"][
                     :, : self.action_horizon
                 ]
-            batch_loss_fn, batch_grad_fn = _make_batch_guidance_fns_from_params(guidance_params)
+                batch_loss_fn, batch_grad_fn = _make_batch_guidance_fns_from_params(guidance_params)
             guidance_factor = guidance_params.get("__gp_guidance_factor__", guidance_params.get("guidance_factor", 1.0))
         elif guidance_fn is not None:
             batch_grad_fn = jax.vmap(jax.grad(guidance_fn))
             batch_loss_fn = jax.vmap(guidance_fn)
-        else:
-            batch_grad_fn = None
 
         use_line_search = guidance_params.get("__gp_line_search__", True) if guidance_params is not None else False
         debug_guidance = guidance_params.get("__gp_debug_guidance__", False) if guidance_params is not None else False
