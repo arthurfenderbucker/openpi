@@ -30,7 +30,7 @@ from openpi.shared import array_typing as at
 logger = logging.getLogger(__name__)
 
 
-def _make_batch_guidance_fns_from_params(guidance_params: dict):
+def _make_batch_guidance_fns_from_params(guidance_params: dict, dynamics_fn=None):
     """Build batched loss AND gradient functions from structured guidance parameter arrays.
 
     Integrates x_t (SO3 velocity actions) to recover EE position trajectories,
@@ -52,6 +52,9 @@ def _make_batch_guidance_fns_from_params(guidance_params: dict):
 
     Args:
         guidance_params: Dict with JAX arrays (keys match ``guidance_builder.GP_KEYS``).
+        dynamics_fn: Optional JAX-differentiable dynamics function with signature
+            ``integrate_actions(x_t, ee_pos_0, ee_ori_0, dt) -> (positions, orientations, gripper)``.
+            When ``None``, the default Euler integration (cumsum) is used.
 
     Returns:
         (batch_loss_fn, batch_grad_fn) where:
@@ -80,10 +83,17 @@ def _make_batch_guidance_fns_from_params(guidance_params: dict):
         # x_t: (total_horizon, action_dim) — unbatched.
         T = expected.shape[1]
 
-        # --- Position-based: integrate velocities to get EE positions --------
-        vel = x_t[:, :3]  # (H, 3)
-        positions = ee_pos_0[None, :] + jnp.cumsum(vel * dt, axis=0)  # (H, 3)
-        positions = positions[:T]  # (T, 3)
+        # --- Integrate actions to get EE state trajectories ------------------
+        if dynamics_fn is not None:
+            positions, predicted_ori, predicted_grip = dynamics_fn(x_t[:T], ee_pos_0, ee_ori_0, dt)
+        else:
+            # Default: Euler integration (cumsum)
+            vel = x_t[:, :3]  # (H, 3)
+            positions = ee_pos_0[None, :] + jnp.cumsum(vel * dt, axis=0)  # (H, 3)
+            positions = positions[:T]  # (T, 3)
+            ori_vel = x_t[:T, 3:6]  # (T, 3)
+            predicted_ori = ee_ori_0[None, :] + jnp.cumsum(ori_vel * dt, axis=0)  # (T, 3)
+            predicted_grip = x_t[:T, 6:7]  # (T, 1)
 
         diffs = positions[:, None, :] - waypoints[None, :, :]  # (T, N, 3)
 
@@ -109,14 +119,10 @@ def _make_batch_guidance_fns_from_params(guidance_params: dict):
         surf_d2 = jnp.sum((pos_exp - surf_exp) ** 2, axis=-1)  # (T, N, S)
         surface_dists = jnp.sqrt(jnp.min(surf_d2, axis=-1) + 1e-8)  # (T, N)
 
-        # --- Orientation-based: integrate angular velocities -----------------
-        ori_vel = x_t[:T, 3:6]  # (T, 3)
-        predicted_ori = ee_ori_0[None, :] + jnp.cumsum(ori_vel * dt, axis=0)  # (T, 3)
-        # Orientation "distance" = dot(predicted_ori, axis) per pair
+        # --- Orientation "distance" = dot(predicted_ori, axis) per pair ------
         ori_dists = jnp.sum(predicted_ori[:, None, :] * axes[None, :, :], axis=-1)  # (T, N)
 
-        # --- Gripper-based: absolute (not integrated) ------------------------
-        predicted_grip = x_t[:T, 6:7]  # (T, 1)
+        # --- Gripper distances -----------------------------------------------
         grip_dists = jnp.broadcast_to(predicted_grip, (T, expected.shape[0]))  # (T, N)
 
         # --- Select distance per pair based on dist_type ---------------------
@@ -215,6 +221,20 @@ class Pi0Grounded(pi0.Pi0):
         super().__init__(config, rngs)
         # Store the number of chunks for inference
         self.num_action_chunks = config.num_action_chunks
+        # Optional external JAX dynamics function for guidance
+        self._dynamics_fn = None
+
+    def set_dynamics_fn(self, fn):
+        """Set a JAX-differentiable dynamics function for guidance.
+
+        The function signature must be::
+
+            integrate_actions(x_t, ee_pos_0, ee_ori_0, dt)
+                -> (positions, orientations, gripper)
+
+        where all inputs/outputs are JAX arrays.
+        """
+        self._dynamics_fn = fn
 
     @at.typecheck
     def embed_suffix(
@@ -336,7 +356,9 @@ class Pi0Grounded(pi0.Pi0):
                 guidance_params["__gp_expected_dists__"] = guidance_params["__gp_expected_dists__"][
                     :, : self.action_horizon
                 ]
-                batch_loss_fn, batch_grad_fn = _make_batch_guidance_fns_from_params(guidance_params)
+                batch_loss_fn, batch_grad_fn = _make_batch_guidance_fns_from_params(
+                    guidance_params, dynamics_fn=self._dynamics_fn
+                )
             guidance_factor = guidance_params.get("__gp_guidance_factor__", guidance_params.get("guidance_factor", 1.0))
         elif guidance_fn is not None:
             batch_grad_fn = jax.vmap(jax.grad(guidance_fn))
@@ -354,8 +376,7 @@ class Pi0Grounded(pi0.Pi0):
         total_horizon = num_action_chunks * self.action_horizon
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, total_horizon, self.action_dim))
-        if debug_guidance:
-            noise = noise * 0.0  # scale down initial noise for stability
+        noise = jnp.where(debug_guidance, noise * 0.0, noise)  # scale down initial noise for stability in debug mode
 
         # first fill KV cache with a forward pass of the prefix (unchanged)
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -404,20 +425,18 @@ class Pi0Grounded(pi0.Pi0):
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
-            if not debug_guidance:
-                (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                    [None, suffix_tokens],
-                    mask=full_attn_mask,
-                    positions=positions,
-                    kv_cache=kv_cache,
-                    adarms_cond=[None, adarms_cond],
-                )
-                assert prefix_out is None
-                # Extract all action predictions (for all chunks)
-                v_t = self.action_out_proj(suffix_out[:, -total_horizon:])
-            else:
-                # In debug mode, skip the forward pass and use a dummy gradient to test guidance effects in isolation.
-                v_t = jnp.zeros_like(x_t)
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            assert prefix_out is None
+            # Extract all action predictions (for all chunks)
+            v_t = self.action_out_proj(suffix_out[:, -total_horizon:])
+            # In debug mode, zero out the forward pass result to test guidance effects in isolation.
+            v_t = jnp.where(debug_guidance, jnp.zeros_like(v_t), v_t)
 
             if batch_grad_fn is not None:
                 # Only compute guidance gradients and alpha on the first action chunk;

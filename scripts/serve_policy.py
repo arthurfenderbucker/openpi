@@ -54,6 +54,12 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
+    # Path to a Python file defining a JAX-differentiable dynamics function for
+    # guidance.  The file must define ``integrate_actions(x_t, ee_pos_0, ee_ori_0, dt)``
+    # returning ``(positions, orientations, gripper)``.  When ``None``, the
+    # model's built-in Euler integration (cumsum) is used.
+    dynamics_model_path: str | None = None
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -99,6 +105,16 @@ def create_policy(args: Args) -> _policy.Policy:
 def main(args: Args) -> None:
     policy = create_policy(args)
     policy_metadata = policy.metadata
+
+    # Load external dynamics model if provided.
+    if args.dynamics_model_path is not None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("dynamics_module", args.dynamics_model_path)
+        dynamics_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dynamics_module)
+        policy.set_dynamics_fn(dynamics_module.integrate_actions)
+        logging.info("Loaded dynamics model from %s", args.dynamics_model_path)
 
     # Record the policy's behavior.
     if args.record:

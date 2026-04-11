@@ -175,6 +175,17 @@ class Policy(BasePolicy):
         }
         return outputs
 
+    def set_dynamics_fn(self, fn):
+        """Set a JAX-differentiable dynamics function on the underlying model.
+
+        The function signature must be::
+
+            integrate_actions(x_t, ee_pos_0, ee_ori_0, dt)
+                -> (positions, orientations, gripper)
+        """
+        if hasattr(self._model, "set_dynamics_fn"):
+            self._model.set_dynamics_fn(fn)
+
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
