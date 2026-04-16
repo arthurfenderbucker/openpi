@@ -71,6 +71,7 @@ def _make_batch_guidance_fns_from_params(guidance_params: dict, dynamics_fn=None
     has_plane = jnp.array(guidance_params["__gp_has_plane__"])  # (N,) uint8
     plane_norms = jnp.array(guidance_params["__gp_plane_normals__"])  # (N, 3)
     surf_pts = jnp.array(guidance_params["__gp_surface_pts__"])  # (N, S, 3)
+    surf_counts = jnp.array(guidance_params["__gp_surface_counts__"])  # (N,) int32
 
     gf_weights = jnp.array(guidance_params["__gp_guidance_weights__"])  # (N,)
     if "__gp_guidance_factor__" in guidance_params:
@@ -103,20 +104,21 @@ def _make_batch_guidance_fns_from_params(guidance_params: dict, dynamics_fn=None
         # Axis distances: dot(waypoint - pos, signed_axis)
         axis_dists = -jnp.sum(diffs * axes[None, :, :], axis=-1)  # (T, N)
 
-        # Axis perpendicular distances: ||component of diff perpendicular to axis||
-        axis_proj_scalar = jnp.sum(diffs * axes[None, :, :], axis=-1, keepdims=True)  # (T, N, 1)
-        perp_vec = diffs - axis_proj_scalar * axes[None, :, :]  # (T, N, 3)
-        axis_perp_dists = jnp.sqrt(jnp.sum(perp_vec**2, axis=-1) + 1e-8)  # (T, N)
-
         # Plane distances: ||in_plane(waypoint - pos)||
         proj = jnp.sum(diffs * plane_norms[None, :, :], axis=-1, keepdims=True)  # (T, N, 1)
         in_plane = diffs - proj * plane_norms[None, :, :]  # (T, N, 3)
         plane_dists = jnp.sqrt(jnp.sum(in_plane**2, axis=-1) + 1e-8)  # (T, N)
 
-        # Surface distances: min ||pos - surf_pt|| over point cloud
+        # Surface distances: min ||pos - surf_pt|| over valid (non-padded) points
         pos_exp = positions[:, None, None, :]  # (T, 1, 1, 3)
         surf_exp = surf_pts[None, :, :, :]  # (1, N, S, 3)
         surf_d2 = jnp.sum((pos_exp - surf_exp) ** 2, axis=-1)  # (T, N, S)
+        # Mask out zero-padded surface points so they don't act as phantom
+        # attractors at the origin.  Padded slots (index >= count) get +inf
+        # so jnp.min ignores them.
+        S = surf_pts.shape[1]
+        valid_mask = jnp.arange(S)[None, :] < surf_counts[:, None]  # (N, S)
+        surf_d2 = jnp.where(valid_mask[None, :, :], surf_d2, jnp.inf)  # (T, N, S)
         surface_dists = jnp.sqrt(jnp.min(surf_d2, axis=-1) + 1e-8)  # (T, N)
 
         # --- Orientation "distance" = dot(predicted_ori, axis) per pair ------
@@ -143,15 +145,8 @@ def _make_batch_guidance_fns_from_params(guidance_params: dict, dynamics_fn=None
 
         errors = dists.T - expected[:, :T]  # (N, T)
 
-        # --- Perpendicular regularization for position axis pairs ------------
-        perp_ref = axis_perp_dists[0:1, :]  # (1, N) — initial perp distance
-        perp_errors = (axis_perp_dists - perp_ref).T  # (N, T)
-        # Only for position axis pairs (not orientation which also uses axes)
-        is_pos_axis = ha.T & ~is_ori.T & ~is_grip.T
-        perp_errors = jnp.where(is_pos_axis, perp_errors, 0.0)
-
         weighted = errors * gf_weights[:, None]  # (N, T)
-        return 0.5 * jnp.sum(weighted**2)  # + 0.5 * jnp.sum(perp_errors**2)
+        return 0.5 * jnp.sum(weighted**2)
 
     batch_loss_fn = jax.vmap(_guidance_fn)
     batch_grad_fn = jax.vmap(jax.grad(_guidance_fn))
@@ -462,7 +457,7 @@ class Pi0Grounded(pi0.Pi0):
                         [direction_first, jnp.zeros_like(x_t[:, self.action_horizon :, :])], axis=1
                     )
                     # Convert position-space step to velocity: dt * v_guidance = alpha * direction
-                    v_t = v_t + guidance_factor * (alpha / dt) * direction
+                    v_t = v_t + (alpha / dt) * direction * guidance_factor
                 else:
                     # Pad with zeros for remaining chunks
                     grad_hat = jnp.concatenate(

@@ -60,6 +60,10 @@ class Args:
     # model's built-in Euler integration (cumsum) is used.
     dynamics_model_path: str | None = None
 
+    # Skip loading model weights (for debug_guidance mode where the policy
+    # forward pass is zeroed out anyway).
+    skip_weights: bool = False
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -82,11 +86,12 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 }
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
+def create_default_policy(env: EnvMode, *, default_prompt: str | None = None, skip_weights: bool = False) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
         return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt,
+            skip_weights=skip_weights,
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
@@ -96,10 +101,11 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt,
+                skip_weights=args.skip_weights,
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return create_default_policy(args.env, default_prompt=args.default_prompt, skip_weights=args.skip_weights)
 
 
 def main(args: Args) -> None:

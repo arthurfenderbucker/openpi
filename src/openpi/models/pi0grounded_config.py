@@ -63,17 +63,18 @@ class Pi0GroundedConfig(pi0_config.Pi0Config):
         return Pi0Grounded(self, rngs=nnx.Rngs(rng))
     
     @override
-    def load_pytorch(self, train_config, weight_path: str):
+    def load_pytorch(self, train_config, weight_path: str, *, skip_weights: bool = False):
         """Load a PyTorch Pi0Grounded/Pi05Grounded model from checkpoint.
-        
+
         This loads the base Pi0/Pi05 weights and creates a Pi0Grounded model that
         can generate multiple action chunks during inference.
         """
         from openpi.models_pytorch.pi0grounded_pytorch import PI0GroundedPytorch
-        
+
         model_variant = "Pi05Grounded" if self.pi05 else "Pi0Grounded"
-        logger.info(f"Loading {model_variant} PyTorch model with num_action_chunks={self.num_action_chunks}")
+        logger.info(f"Loading {model_variant} PyTorch model with num_action_chunks={self.num_action_chunks} (skip_weights={skip_weights})")
         logger.info(f"train_config: {train_config}")
         model = PI0GroundedPytorch(config=train_config.model)
-        safetensors.torch.load_model(model, weight_path)
+        if not skip_weights:
+            safetensors.torch.load_model(model, weight_path)
         return model
