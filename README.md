@@ -47,6 +47,9 @@ We use [uv](https://docs.astral.sh/uv/) to manage Python dependencies. See the [
 ```bash
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+
+# Install the policy-steering package (lightweight JAX guidance functions)
+uv pip install -e ../../packages/policy_steering
 ```
 
 NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.

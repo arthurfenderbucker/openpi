@@ -5,34 +5,10 @@ import time
 from typing import Any, TypeAlias
 
 import cloudpickle
+from policy_steering import extract_guidance_params
 
 _GUIDANCE_KEY = "__guidance_fn__"
 _RNG_SEED_KEY = "__rng_seed__"
-_GUIDANCE_PARAMS_SENTINEL = "__gp_expected_dists__"
-_GUIDANCE_PARAMS_ALL_KEYS = (
-    "__gp_ee_pos_0__",
-    "__gp_dt__",
-    "__gp_expected_dists__",
-    "__gp_dist_types__",
-    "__gp_waypoints__",
-    "__gp_has_axis__",
-    "__gp_axes__",
-    "__gp_has_plane__",
-    "__gp_plane_normals__",
-    "__gp_surface_counts__",
-    "__gp_surface_pts__",
-    "__gp_guidance_factors__",
-    "__gp_guidance_factor__",
-    "__gp_guidance_weights__",
-    "__gp_num_chunks__",
-    "__gp_debug_guidance__",
-    # Pose guidance (orientation + gripper)
-    "__gp_ee_ori_0__",
-    "__gp_ref_orientation__",
-    "__gp_ori_weight__",
-    "__gp_ref_gripper__",
-    "__gp_gripper_weight__",
-)
 
 import flax
 import flax.traverse_util
@@ -108,9 +84,8 @@ class Policy(BasePolicy):
         if _GUIDANCE_KEY in obs:
             guidance_fn = cloudpickle.loads(obs[_GUIDANCE_KEY].tobytes())
             obs = {k: v for k, v in obs.items() if k != _GUIDANCE_KEY}
-        elif _GUIDANCE_PARAMS_SENTINEL in obs:
-            guidance_params = {k: obs[k] for k in _GUIDANCE_PARAMS_ALL_KEYS if k in obs}
-            obs = {k: v for k, v in obs.items() if k not in _GUIDANCE_PARAMS_ALL_KEYS}
+        else:
+            guidance_params, obs = extract_guidance_params(obs)
 
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
@@ -148,14 +123,8 @@ class Policy(BasePolicy):
             sample_kwargs["guidance_fn"] = guidance_fn
             actions = self._model.sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
         elif guidance_params is not None and not self._is_pytorch_model:
-            # Params are plain JAX arrays — fully JIT-compatible, no bypass needed.
-            # Boolean control-flow flags must stay as Python bools — converting
-            # them to JAX arrays causes TracerBoolConversionError inside jit.
-            _bool_keys = {"__gp_debug_guidance__", "__gp_line_search__"}
-            sample_kwargs["guidance_params"] = {
-                k: (bool(v) if k in _bool_keys else jnp.asarray(v))
-                for k, v in guidance_params.items()
-            }
+            # guidance_params already has JAX arrays + Python bools (from extract_guidance_params).
+            sample_kwargs["guidance_params"] = guidance_params
             actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
         else:
             actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
