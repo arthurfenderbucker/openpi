@@ -30,25 +30,70 @@ from openpi.shared import array_typing as at
 logger = logging.getLogger(__name__)
 
 
+# --------------------------------------------------------------------------- #
+# Panda gripper geometry constants (metres) — must match utils/gripper.py     #
+# --------------------------------------------------------------------------- #
+_FINGER_X_REST = 0.0085
+_FINGER_Z_FROM_GRIP = 0.0114
+
+
+def _jax_axis_angle_to_matrix(rotvec):
+    """Convert axis-angle vector (3,) to rotation matrix (3, 3) via Rodrigues.
+
+    Handles the near-zero-rotation case by adding a small epsilon to the angle
+    norm so that the division is safe and gradients remain finite.
+    """
+    angle = jnp.linalg.norm(rotvec)
+    axis = rotvec / (angle + 1e-8)
+    K = jnp.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
+    return jnp.eye(3) + jnp.sin(angle) * K + (1.0 - jnp.cos(angle)) * (K @ K)
+
+
+def _jax_finger_positions(ee_pos, ee_ori, gripper_val):
+    """Compute both finger-tip positions in world frame using JAX ops.
+
+    Uses the symmetric approximation ``q1 = gripper_val / 2``,
+    ``q2 = -gripper_val / 2`` (valid for the Panda gripper where
+    ``gripper_val = q1 - q2`` and the fingers are symmetric).
+
+    Args:
+        ee_pos: (3,) EE grip-site position in world frame.
+        ee_ori: (3,) EE orientation as axis-angle vector.
+        gripper_val: scalar gripper opening (q1 - q2).
+
+    Returns:
+        (left_tip, right_tip) — each (3,) in world frame.
+    """
+    q1 = gripper_val / 2.0
+    q2 = -gripper_val / 2.0
+    left_local = jnp.array([0.0, -(q1 + _FINGER_X_REST), _FINGER_Z_FROM_GRIP])
+    right_local = jnp.array([0.0, -q2 + _FINGER_X_REST, _FINGER_Z_FROM_GRIP])
+    R = _jax_axis_angle_to_matrix(ee_ori)
+    return ee_pos + R @ left_local, ee_pos + R @ right_local
+
+
+# Vectorized version over time dimension
+_jax_finger_positions_vmap = jax.vmap(_jax_finger_positions, in_axes=(0, 0, 0), out_axes=(0, 0))
+
+
 def _make_batch_guidance_fns_from_params(guidance_params: dict, dynamics_fn=None):
     """Build batched loss AND gradient functions from structured guidance parameter arrays.
 
-    Integrates x_t (SO3 velocity actions) to recover EE position trajectories,
-    computes distances from those positions to the reference waypoints, then
-    returns both a loss and a gradient of a squared-error potential via JAX autograd.
+    Integrates x_t (SO3 velocity actions) to recover EE state trajectories,
+    computes distances from those states (or derived quantities like finger
+    positions) to the reference waypoints, then returns both a loss and a
+    gradient of a squared-error potential via JAX autograd.
 
-    For each pair *i* and chunk-timestep *k*::
+    Source entity types (per pair, selected by ``__gp_source_type__``):
+        - 0 (EE):        distance from EE position
+        - 1 (finger_l):  distance from left finger tip (via FK)
+        - 2 (finger_r):  distance from right finger tip (via FK)
+        - 3 (orientation): orientation projection ``dot(ori, axis)``
+        - 4 (gripper):    gripper aperture scalar
 
-        pos[k]       = ee_pos_0 + cumsum(x_t[:k+1, :3])
-        dist[i, k]   = distance_fn_i(pos[k], waypoints[i])   (type-dependent)
-        error[i, k]  = dist[i, k] - expected[i, k]
-        f(x_t)       = 0.5 * Σ_{i,k} (error[i, k] * gf_factor[i])²
-
-    Distance type selection per pair (broadcast over T):
-        - Surface (dist_type=1): min distance from pos to surface point cloud
-        - Axis (has_axis=1):     dot(waypoint - pos, signed_axis)
-        - Plane (has_plane=1):   ||in_plane(waypoint - pos)||
-        - Centroid (default):    ||pos - waypoint||
+    For source types 0–2, the distance computation is selected by
+    ``dist_type`` (centroid/axis/plane/surface).  For types 3–4, dedicated
+    distance semantics apply.
 
     Args:
         guidance_params: Dict with JAX arrays (keys match ``guidance_builder.GP_KEYS``).
@@ -65,6 +110,12 @@ def _make_batch_guidance_fns_from_params(guidance_params: dict, dynamics_fn=None
     dt = jnp.array(guidance_params["__gp_dt__"])  # scalar
     expected = jnp.array(guidance_params["__gp_expected_dists__"])  # (N, T)
     dist_types = jnp.array(guidance_params["__gp_dist_types__"])  # (N,) uint8
+    source_types = jnp.array(
+        guidance_params.get(
+            "__gp_source_type__",
+            jnp.zeros(expected.shape[0], dtype=jnp.uint8),
+        )
+    )  # (N,) uint8
     waypoints = jnp.array(guidance_params["__gp_waypoints__"])  # (N, 3)
     has_axis = jnp.array(guidance_params["__gp_has_axis__"])  # (N,) uint8
     axes = jnp.array(guidance_params["__gp_axes__"])  # (N, 3) signed
@@ -77,8 +128,14 @@ def _make_batch_guidance_fns_from_params(guidance_params: dict, dynamics_fn=None
     if "__gp_guidance_factor__" in guidance_params:
         gf_weights = jnp.full_like(gf_weights, guidance_params["__gp_guidance_factor__"])
 
-    # EE orientation for orientation-type distance pairs
+    # EE orientation and gripper state for FK-based guidance
     ee_ori_0 = jnp.array(guidance_params.get("__gp_ee_ori_0__", jnp.zeros(3)))
+    gripper_0 = jnp.array(guidance_params.get("__gp_gripper_0__", jnp.zeros(1)))
+
+    # Pre-compute boolean masks for source type selection (avoid repeated comparisons)
+    is_finger_l = source_types == 1  # (N,)
+    is_finger_r = source_types == 2  # (N,)
+    has_fingers = jnp.any(is_finger_l | is_finger_r)
 
     def _guidance_fn(x_t):
         # x_t: (total_horizon, action_dim) — unbatched.
@@ -94,28 +151,45 @@ def _make_batch_guidance_fns_from_params(guidance_params: dict, dynamics_fn=None
             positions = positions[:T]  # (T, 3)
             ori_vel = x_t[:T, 3:6]  # (T, 3)
             predicted_ori = ee_ori_0[None, :] + jnp.cumsum(ori_vel * dt, axis=0)  # (T, 3)
-            predicted_grip = x_t[:T, 6:7]  # (T, 1)
+            predicted_grip = x_t[:T, 6:7]  # (T, 1) — absolute, not integrated
 
-        diffs = positions[:, None, :] - waypoints[None, :, :]  # (T, N, 3)
+        # --- Compute finger positions via FK (only when needed) --------------
+        # Always compute to keep shapes static for JIT; the cost is minimal
+        # when no finger pairs exist (results are unused).
+        left_fingers, right_fingers = _jax_finger_positions_vmap(
+            positions, predicted_ori, predicted_grip[:, 0]
+        )  # each (T, 3)
 
-        # Centroid distances: ||pos - waypoint||
+        # --- Build per-pair source positions based on source_type ------------
+        # source_types: 0=EE, 1=finger_l, 2=finger_r, 3=ori, 4=grip
+        # For types 3,4 the position is unused but must have valid shape.
+        source_pos = jnp.where(
+            is_finger_l[None, :, None],
+            left_fingers[:, None, :],
+            jnp.where(
+                is_finger_r[None, :, None],
+                right_fingers[:, None, :],
+                positions[:, None, :],  # default: EE position
+            ),
+        )  # (T, N, 3)
+
+        diffs = source_pos - waypoints[None, :, :]  # (T, N, 3)
+
+        # Centroid distances: ||source - waypoint||
         centroid_dists = jnp.sqrt(jnp.sum(diffs**2, axis=-1) + 1e-8)  # (T, N)
 
-        # Axis distances: dot(waypoint - pos, signed_axis)
+        # Axis distances: dot(waypoint - source, signed_axis)
         axis_dists = -jnp.sum(diffs * axes[None, :, :], axis=-1)  # (T, N)
 
-        # Plane distances: ||in_plane(waypoint - pos)||
+        # Plane distances: ||in_plane(waypoint - source)||
         proj = jnp.sum(diffs * plane_norms[None, :, :], axis=-1, keepdims=True)  # (T, N, 1)
         in_plane = diffs - proj * plane_norms[None, :, :]  # (T, N, 3)
         plane_dists = jnp.sqrt(jnp.sum(in_plane**2, axis=-1) + 1e-8)  # (T, N)
 
-        # Surface distances: min ||pos - surf_pt|| over valid (non-padded) points
-        pos_exp = positions[:, None, None, :]  # (T, 1, 1, 3)
+        # Surface distances: min ||source - surf_pt|| over valid points
+        src_exp = source_pos[:, :, None, :]  # (T, N, 1, 3)
         surf_exp = surf_pts[None, :, :, :]  # (1, N, S, 3)
-        surf_d2 = jnp.sum((pos_exp - surf_exp) ** 2, axis=-1)  # (T, N, S)
-        # Mask out zero-padded surface points so they don't act as phantom
-        # attractors at the origin.  Padded slots (index >= count) get +inf
-        # so jnp.min ignores them.
+        surf_d2 = jnp.sum((src_exp - surf_exp) ** 2, axis=-1)  # (T, N, S)
         S = surf_pts.shape[1]
         valid_mask = jnp.arange(S)[None, :] < surf_counts[:, None]  # (N, S)
         surf_d2 = jnp.where(valid_mask[None, :, :], surf_d2, jnp.inf)  # (T, N, S)
