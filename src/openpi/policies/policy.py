@@ -86,6 +86,14 @@ class Policy(BasePolicy):
             obs = {k: v for k, v in obs.items() if k != _GUIDANCE_KEY}
         else:
             guidance_params, obs = extract_guidance_params(obs)
+            if guidance_params is not None:
+                # extract_guidance_params returns numpy arrays (backend-agnostic);
+                # convert to jnp here so downstream JIT'd guidance_fns operate on
+                # the right tensor type. Bool keys stay as Python bools.
+                guidance_params = {
+                    k: (v if isinstance(v, bool) else jnp.asarray(v))
+                    for k, v in guidance_params.items()
+                }
 
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
